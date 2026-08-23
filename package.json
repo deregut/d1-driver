@@ -1,0 +1,15 @@
+{
+  "name": "d1-drive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloud Drive on Cloudflare: Pages frontend + D1 blob storage + WebDAV",
+  "scripts": {
+    "dev": "wrangler pages dev -p 8788",
+    "deploy": "wrangler pages deploy",
+    "db:init:local": "wrangler d1 execute d1-drive --local --file=schema.sql",
+    "db:init:remote": "wrangler d1 execute d1-drive --remote --file=schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

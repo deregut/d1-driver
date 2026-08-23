@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+*.tar.gz
+*.zip
+*wrangler-dev.log
+*wrangler-auth.log
+*.sqlite*
+browser_screenshot_*.png

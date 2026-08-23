@@ -1,0 +1,18 @@
+name = "d1-drive"
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "public"
+
+# ── D1 database binding ─────────────────────────────────────────────
+# After `wrangler d1 create d1-drive`, paste the printed database_id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "d1-drive"
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+
+# ── Optional HTTP Basic auth for BOTH the web UI API and WebDAV ────
+# Set these as secret env vars instead if you prefer:
+#   npx wrangler pages secret put AUTH_USER
+#   npx wrangler pages secret put AUTH_PASSWORD
+[vars]
+# AUTH_USER = "admin"
+# AUTH_PASSWORD = "change-me"
