@@ -506,6 +506,7 @@ function ext(name) { return (name.split('.').pop() || '').toLowerCase(); }
 
 const PIECE_SIZE = 4 * 1024 * 1024;     // bytes per HTTP request (8 × 512 KiB chunks)
 const PIECE_PARALLEL = 3;
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // keep in sync with store.js
 
 let trayVisible = false;
 
@@ -519,6 +520,10 @@ async function uploadFiles(fileList) {
 }
 
 async function uploadOne(file) {
+  if (file.size > MAX_FILE_SIZE) {
+    toast(`${file.name}: too large (max ${fmtBytes(MAX_FILE_SIZE)})`, 'err');
+    return;
+  }
   const el = document.createElement('div');
   el.className = 'up-item';
   el.innerHTML = `
@@ -593,7 +598,7 @@ async function sendPieceWithRetry(id, seq, blob) {
 
 function refreshUsage() {
   api('/usage').then((u) => {
-    const LIMIT = 10 * 1024 ** 3;
+    const LIMIT = 500 * 1024 ** 2; // D1 free plan: 500 MB per database
     const pct = Math.min(100, (u.bytes / LIMIT) * 100);
     $('#storage-used').textContent = fmtBytes(u.bytes) + ' used';
     $('#storage-files').textContent = `${u.files} files · ${u.folders} folders`;
