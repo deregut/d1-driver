@@ -21,7 +21,7 @@ A personal cloud drive that runs **entirely on Cloudflare** — no servers, no S
 | Copy | “Copy to…” dialog; recursive folder copy; WebDAV `COPY` |
 | Preview | Images, video, audio, and text/code files inline |
 | Search & sort | Client-side filter of current folder; sort by name/size/date |
-| WebDAV | Full class-1 server: `OPTIONS PROPFIND GET HEAD PUT MKCOL DELETE MOVE COPY` |
+| WebDAV | `OPTIONS PROPFIND PROPPATCH GET HEAD PUT MKCOL DELETE MOVE COPY LOCK UNLOCK` (locks are stateless stubs so Finder/iOS/Office treat the share as writable) |
 | Auth (optional) | HTTP Basic auth over both `/api/*` and `/dav/*` |
 
 ## 🧠 How storage works
@@ -160,7 +160,17 @@ d1-drive/
 - **Max upload:** **50 MB per file** (`MAX_FILE_SIZE` in `functions/lib/store.js`, mirrored in `public/app.js`). Downloads are assembled in memory and Pages Functions have a 128 MB memory limit, so don't raise this much.
 - **D1 row limit:** a single row/BLOB can't exceed ~2 MB, so each 4 MB upload piece is split into 512 KiB rows server-side (`putPiece`).
 - **No range requests yet:** video seeks download whole-file previews only (progressive playback still works).
-- **No locks / versioning:** advertised as DAV class 1, which is what rclone/Finder/Cyberduck need for file transfer.
+- **No real locking / versioning:** `LOCK`/`UNLOCK`/`PROPPATCH` are accepted but stateless, so two clients can still overwrite each other. Overwrites (`PUT`, `COPY`, `MOVE`) are applied atomically — a failed write never leaves a half-written file.
+
+### Troubleshooting WebDAV (HTTP 500 etc.)
+
+1. Reproduce with curl and read the body:
+   ```bash
+   curl -i -X PROPFIND -u USER:PASS -H 'Depth: 1' https://<your-domain>/dav/
+   ```
+2. Add a secret `DAV_DEBUG=1` (`npx wrangler pages secret put DAV_DEBUG`) and redeploy — 500 responses then include the real error message. Remove it afterwards.
+3. Live logs: `npx wrangler pages deployment tail --project-name <project>`.
+4. Browser-based WebDAV apps need CORS: set `DAV_CORS_ORIGINS` to `*` or a comma-separated list of origins (default: off).
 - **Public instance?** Anyone with the URL can read/write unless you set `AUTH_USER`/`AUTH_PASSWORD`. Seriously, set them.
 
 ## 📜 License
