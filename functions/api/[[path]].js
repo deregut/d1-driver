@@ -90,7 +90,7 @@ export async function onRequest({ request, env }) {
       const body = await readJson(request);
       const path = store.assertChildPath(body.path);
       const size = Number(body.size) || 0;
-      if (size > 1024 * 1024 * 1024) return json({ error: 'Max file size is 1 GB' }, 400);
+      if (size > store.MAX_FILE_SIZE) return json({ error: 'Max file size is 50 MB' }, 413);
       const id = await store.initFile(db, path, body.mime, size);
       return json({ ok: true, id });
     }
@@ -103,7 +103,7 @@ export async function onRequest({ request, env }) {
       }
       const buf = new Uint8Array(await request.arrayBuffer());
       if (!buf.byteLength) return json({ error: 'Empty chunk' }, 400);
-      await store.putChunk(db, id, seq, buf);
+      await store.putPiece(db, id, seq, buf);
       return json({ ok: true, received: buf.byteLength });
     }
 
@@ -112,6 +112,7 @@ export async function onRequest({ request, env }) {
       const id = Number(body.id);
       const size = Number(body.size) || 0;
       if (!Number.isInteger(id)) return json({ error: 'Bad id' }, 400);
+      if (size > store.MAX_FILE_SIZE) return json({ error: 'Max file size is 50 MB' }, 413);
       const bytes = await store.finishFile(db, id, size);
       return json({ ok: true, size: bytes });
     }
