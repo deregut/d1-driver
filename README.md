@@ -67,7 +67,14 @@ WebDAV endpoint: `https://<project>.pages.dev/dav/`
 
 ### Optional: enable authentication
 
-Set two variables on your Pages project (**Settings → Variables**) or uncomment them in `wrangler.toml`:
+Because `wrangler.toml` manages this Pages project, set them as secrets (recommended) or uncomment them in `wrangler.toml`:
+
+```bash
+npx wrangler pages secret put AUTH_USER
+npx wrangler pages secret put AUTH_PASSWORD
+```
+
+Or, in `wrangler.toml`:
 
 ```
 AUTH_USER=you@example.com
@@ -89,7 +96,7 @@ Reset local data anytime:
 npx wrangler d1 execute d1-drive --local --command "DELETE FROM chunks; DELETE FROM nodes;"
 ```
 
-Smoke-test everything (30 checks: CRUD, chunked upload integrity, all WebDAV verbs):
+Smoke-test everything (35 checks: CRUD, chunked upload integrity, all WebDAV verbs):
 
 ```bash
 sh scripts/smoke-test.sh        # while npm run dev is running
@@ -142,15 +149,16 @@ d1-drive/
 │   │   └── auth.js          # timing-safe Basic auth
 │   ├── api/[[path]].js      # JSON API for the web UI
 │   └── dav/[[path]].js      # WebDAV server (RFC 4918 subset)
-├── scripts/smoke-test.sh    # end-to-end test suite (30 checks)
+├── scripts/smoke-test.sh    # end-to-end test suite
 ├── schema.sql               # D1 schema
 └── wrangler.toml            # bindings config
 ```
 
 ## ⚠️ Limitations & honest notes
 
-- **D1 size ceiling:** databases max out around **10 GB** (Cloudflare plan limit). The sidebar ring tracks usage against that. For bigger libraries, point `store.js` at R2 — the API surface stays identical.
-- **Max upload:** 1 GB per file by default (`upload-init` guard); memory-bound assembly favors smaller files.
+- **D1 size ceiling:** the **free plan allows ~500 MB per database** (paid plans: 10 GB). The sidebar ring tracks usage against 500 MB; change `LIMIT` in `public/app.js` if you upgrade.
+- **Max upload:** **50 MB per file** (`MAX_FILE_SIZE` in `functions/lib/store.js`, mirrored in `public/app.js`). Downloads are assembled in memory and Pages Functions have a 128 MB memory limit, so don't raise this much.
+- **D1 row limit:** a single row/BLOB can't exceed ~2 MB, so each 4 MB upload piece is split into 512 KiB rows server-side (`putPiece`).
 - **No range requests yet:** video seeks download whole-file previews only (progressive playback still works).
 - **No locks / versioning:** advertised as DAV class 1, which is what rclone/Finder/Cyberduck need for file transfer.
 - **Public instance?** Anyone with the URL can read/write unless you set `AUTH_USER`/`AUTH_PASSWORD`. Seriously, set them.
