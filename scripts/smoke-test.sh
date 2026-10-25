@@ -70,6 +70,16 @@ C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/upload-init" -H 'cont
   -d '{"path":"/photos/huge.bin","size":52428801}')
 check "upload-init >50MB -> 413" 413 "$C"
 
+# 4d. WebDAV extras: HEAD, LOCK/UNLOCK, PROPPATCH
+C=$(curl -s -o /dev/null -w "%{http_code}" -X LOCK "$B/dav/lock-test.txt" -H 'Timeout: Second-60' -d '<lockinfo/>')
+check "WebDAV LOCK (creates empty file)" 201 "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X UNLOCK "$B/dav/lock-test.txt" -H 'Lock-Token: <opaquelocktoken:x>')
+check "WebDAV UNLOCK" 204 "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X PROPPATCH "$B/dav/lock-test.txt" -d '<propertyupdate/>')
+check "WebDAV PROPPATCH" 207 "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$B/dav/lock-test.txt")
+check "WebDAV cleanup lock-test" 204 "$C"
+
 # 5. small file via single PUT through WebDAV
 echo "hello from webdav" > /tmp/hello.txt
 C=$(curl -s -o /dev/null -w "%{http_code}" -T /tmp/hello.txt "$B/dav/docs/hello.txt")
