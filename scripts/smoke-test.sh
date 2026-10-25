@@ -47,6 +47,29 @@ check "upload-finish" 200 "$C"
 curl -s "$B/api/download?path=%2Fphotos%2Fbig-test.bin" -o /tmp/dl.bin
 if cmp -s /tmp/test.bin /tmp/dl.bin; then check "download matches original" same same; else check "download matches original" same different; fi
 
+# 4b. real browser path: 4 MiB pieces (5 MiB file = 4 MiB + 1 MiB), out of order
+head -c 5242880 /dev/urandom > /tmp/test5.bin
+INIT=$(curl -s -X POST "$B/api/upload-init" -H 'content-type: application/json' \
+  -d '{"path":"/photos/five.bin","size":5242880,"mime":"application/octet-stream"}')
+ID5=$(echo "$INIT" | sed 's/.*"id":\([0-9]*\).*/\1/')
+dd if=/tmp/test5.bin bs=4194304 skip=1 count=1 of=/tmp/p1.bin status=none
+dd if=/tmp/test5.bin bs=4194304 skip=0 count=1 of=/tmp/p0.bin status=none
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/upload-piece?id=$ID5&seq=1" --data-binary @/tmp/p1.bin)
+check "4MiB-piece upload seq=1" 200 "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/upload-piece?id=$ID5&seq=0" --data-binary @/tmp/p0.bin)
+check "4MiB-piece upload seq=0" 200 "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/upload-finish" -H 'content-type: application/json' -d "{\"id\":$ID5,\"size\":5242880}")
+check "4MiB-piece finish" 200 "$C"
+curl -s "$B/api/download?path=%2Fphotos%2Ffive.bin" -o /tmp/dl5.bin
+if cmp -s /tmp/test5.bin /tmp/dl5.bin; then check "4MiB-piece download matches" same same; else check "4MiB-piece download matches" same different; fi
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/delete" -H 'content-type: application/json' -d '{"path":"/photos/five.bin"}')
+check "cleanup five.bin" 200 "$C"
+
+# 4c. >50 MB rejected at init
+C=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$B/api/upload-init" -H 'content-type: application/json' \
+  -d '{"path":"/photos/huge.bin","size":52428801}')
+check "upload-init >50MB -> 413" 413 "$C"
+
 # 5. small file via single PUT through WebDAV
 echo "hello from webdav" > /tmp/hello.txt
 C=$(curl -s -o /dev/null -w "%{http_code}" -T /tmp/hello.txt "$B/dav/docs/hello.txt")
