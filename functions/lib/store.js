@@ -17,6 +17,12 @@ export const PIECE_MAX = CHUNKS_PER_PIECE * CHUNK_SIZE; // 4 MiB
 // assembled in memory, so keep this well below that.
 export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MiB
 
+// Rows being written by writeFile/copy live under this (never-listed) parent
+// until they are swapped into place atomically.
+const STAGE = '/.__stage__';
+const STAGE_TTL_MS = 60 * 60 * 1000;
+const rand = () => Math.random().toString(36).slice(2, 10);
+
 export class StoreError extends Error {
   constructor(message, status = 400) {
     super(message);
@@ -220,11 +226,49 @@ export async function finishFile(db, id, expectedSize) {
 }
 
 // One-shot write of a whole file from a single buffer.
+// The new content is staged under a hidden parent, verified, and then swapped in
+// with the old file removal inside one batch (transaction), so a failure midway
+// never leaves a half-written or missing file.
 export async function writeFile(db, path, bytes, mime) {
   path = assertChildPath(path);
   if (bytes.byteLength > MAX_FILE_SIZE) throw new StoreError('File too large (max 50 MB)', 413);
-  const id = await initFile(db, path, mime, bytes.byteLength);
-  await insertChunks(db, id, bytes);
+  await mustBeFolder(db, parentOf(path));
+  const prev = await getNode(db, path);
+  if (prev && prev.is_folder) throw new StoreError('A folder exists at that path', 409);
+
+  const t = now();
+  // Opportunistic cleanup of abandoned staging rows.
+  await db.batch([
+    db.prepare('DELETE FROM chunks WHERE node_id IN (SELECT id FROM nodes WHERE parent_path = ? AND updated_at < ?)')
+      .bind(STAGE, t - STAGE_TTL_MS),
+    db.prepare('DELETE FROM nodes WHERE parent_path = ? AND updated_at < ?').bind(STAGE, t - STAGE_TTL_MS),
+  ]);
+
+  const stagePath = `${STAGE}/${t}-${rand()}`;
+  const r = await db.prepare(
+    'INSERT INTO nodes (path, parent_path, name, is_folder, size, mime, created_at, updated_at) ' +
+    'VALUES (?, ?, ?, 0, ?, ?, ?, ?) RETURNING id'
+  ).bind(stagePath, STAGE, baseName(path), bytes.byteLength, mime || guessMime(path),
+         (prev && prev.created_at) || t, t).first();
+  const id = r.id;
+  try {
+    await insertChunks(db, id, bytes);
+    const agg = await db.prepare(
+      'SELECT COALESCE(SUM(LENGTH(data)),0) AS bytes FROM chunks WHERE node_id = ?'
+    ).bind(id).first();
+    if (agg.bytes !== bytes.byteLength) throw new StoreError('Write verification failed', 500);
+  } catch (e) {
+    try { await dropChunks(db, id); await deleteRow(db, id); } catch { /* best effort */ }
+    throw e;
+  }
+  const stmts = [];
+  if (prev) {
+    stmts.push(db.prepare('DELETE FROM chunks WHERE node_id = ?').bind(prev.id));
+    stmts.push(db.prepare('DELETE FROM nodes WHERE id = ?').bind(prev.id));
+  }
+  stmts.push(db.prepare('UPDATE nodes SET path = ?, parent_path = ?, name = ?, updated_at = ? WHERE id = ?')
+    .bind(path, normPath(parentOf(path)), baseName(path), now(), id));
+  await db.batch(stmts);
   return id;
 }
 
@@ -298,13 +342,65 @@ export async function moveNode(db, from, to) {
   if (dest && !!dest.is_folder !== !!src.is_folder) {
     throw new StoreError('Target exists with a different type', 409);
   }
-  if (dest && !dest.is_folder) {
-    // Overwrite an existing file at destination.
-    await dropChunks(db, dest.id);
-    await deleteRow(db, dest.id);
-  } else if (dest && dest.is_folder) {
+  if (dest && dest.is_folder) {
     // Merge not supported for folders — keep it predictable.
     throw new StoreError('Target folder already exists', 409);
+  }
+
+  const subtree = await selectSubtree(db, from);
+  const stmts = [];
+  if (dest) { // overwrite an existing file: removed in the same transaction as the rename
+    stmts.push(db.prepare('DELETE FROM chunks WHERE node_id = ?').bind(dest.id));
+    stmts.push(db.prepare('DELETE FROM nodes WHERE id = ?').bind(dest.id));
+  }
+  for (const row of subtree) {
+    const newPath = to + row.path.slice(from.length);
+    const newParent = newPath === to ? normPath(parentOf(to)) : parentOf(newPath);
+    const newName = newPath === to ? baseName(to) : row.name;
+    stmts.push(db.prepare('UPDATE nodes SET path=?, parent_path=?, name=? WHERE id=?')
+      .bind(newPath, newParent, newName, row.id));
+  }
+  // One transaction when it fits; very large trees are applied in slices.
+  for (let i = 0; i < stmts.length; i += 400) await db.batch(stmts.slice(i, i + 400));
+}
+
+// Copy a file or a whole folder tree. With { overwrite: true } an existing
+// *file* at the destination is replaced atomically; folders must be removed by
+// the caller first.
+export async function copyNode(db, from, to, { overwrite = false } = {}) {
+  from = assertChildPath(from);
+  to = assertChildPath(to);
+  if (from === to) return 0;
+  if ((to + '/').startsWith(from + '/')) throw new StoreError('Cannot copy into itself', 400);
+  const src = await getNode(db, from);
+  if (!src) throw new StoreError('Source not found', 404);
+  await mustBeFolder(db, parentOf(to));
+  const dest = await getNode(db, to);
+  if (dest && !!dest.is_folder !== !!src.is_folder) throw new StoreError('Target exists with a different type', 409);
+  if (dest && (!overwrite || dest.is_folder)) throw new StoreError('Target already exists', 409);
+
+  const t = now();
+  const insNode = (path, parent, name, row) => db.prepare(
+    'INSERT INTO nodes (path, parent_path, name, is_folder, size, mime, created_at, updated_at) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(path, parent, name, row.is_folder, row.size, row.mime, row.created_at || t, t);
+  const insChunks = (newPath, oldId) => db.prepare(
+    'INSERT INTO chunks (node_id, seq, data) ' +
+    'SELECT (SELECT id FROM nodes WHERE path = ?), seq, data FROM chunks WHERE node_id = ?'
+  ).bind(newPath, oldId);
+
+  // Single file replacing an existing file: stage, then swap — all in one batch.
+  if (dest) {
+    const stagePath = `${STAGE}/${t}-${rand()}`;
+    await db.batch([
+      insNode(stagePath, STAGE, baseName(to), src),
+      insChunks(stagePath, src.id),
+      db.prepare('DELETE FROM chunks WHERE node_id = ?').bind(dest.id),
+      db.prepare('DELETE FROM nodes WHERE id = ?').bind(dest.id),
+      db.prepare('UPDATE nodes SET path = ?, parent_path = ?, name = ? WHERE path = ?')
+        .bind(to, normPath(parentOf(to)), baseName(to), stagePath),
+    ]);
+    return 1;
   }
 
   const subtree = await selectSubtree(db, from);
@@ -313,52 +409,12 @@ export async function moveNode(db, from, to) {
     const newPath = to + row.path.slice(from.length);
     const newParent = newPath === to ? normPath(parentOf(to)) : parentOf(newPath);
     const newName = newPath === to ? baseName(to) : row.name;
-    stmts.push(db.prepare('UPDATE nodes SET path=?, parent_path=?, name=? WHERE id=?')
-      .bind(newPath, newParent, newName, row.id));
-    if (stmts.length >= PARAM_BATCH) { await db.batch(stmts); stmts.length = 0; }
+    stmts.push(insNode(newPath, newParent, newName, row));
+    if (!row.is_folder) stmts.push(insChunks(newPath, row.id));
   }
-  if (stmts.length) await db.batch(stmts);
-}
-
-export async function copyNode(db, from, to) {
-  from = assertChildPath(from);
-  to = assertChildPath(to);
-  if (from === to) return;
-  if ((to + '/').startsWith(from + '/')) throw new StoreError('Cannot copy into itself', 400);
-  const src = await getNode(db, from);
-  if (!src) throw new StoreError('Source not found', 404);
-  await mustBeFolder(db, parentOf(to));
-  const dest = await getNode(db, to);
-  if (dest && !!dest.is_folder !== !!src.is_folder) throw new StoreError('Target exists with a different type', 409);
-  if (dest) throw new StoreError('Target already exists', 409);
-
-  const subtree = await selectSubtree(db, from);
-  const t = now();
-  const idMap = new Map(); // old id -> new id
-
-  async function cloneRow(row, newPath) {
-    const newParent = newPath === to ? normPath(parentOf(to)) : parentOf(newPath);
-    const newName = newPath === to ? baseName(to) : row.name;
-    const r = await db.prepare(
-      'INSERT INTO nodes (path, parent_path, name, is_folder, size, mime, created_at, updated_at) ' +
-      'VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id'
-    ).bind(newPath, newParent, newName, row.is_folder, row.size, row.mime,
-           row.created_at || t, t).first();
-    idMap.set(row.id, r.id);
-    if (!row.is_folder) {
-      await db.batch([
-        db.prepare('INSERT INTO chunks (node_id, seq, data) SELECT ?, seq, data FROM chunks WHERE node_id = ?')
-          .bind(r.id, row.id),
-      ]);
-    }
-  }
-
-  // Parents before children: rows are ordered by path, so prefix order holds.
-  for (const row of subtree) {
-    const newPath = to + row.path.slice(from.length);
-    await cloneRow(row, newPath);
-  }
-  return idMap.size;
+  // ~20 files per round trip keeps us far below the 50-queries-per-request limit.
+  for (let i = 0; i < stmts.length; i += 40) await db.batch(stmts.slice(i, i + 40));
+  return subtree.length;
 }
 
 // ── Mime sniffing (best effort by extension) ────────────────────────────────
