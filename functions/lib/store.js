@@ -6,7 +6,16 @@
 export const CHUNK_SIZE = 512 * 1024; // 512 KiB per D1 row — safely under limits
 const INSERT_BATCH = 8;               // chunks per db.batch() (8 × 512KiB = 4MiB)
 const PARAM_BATCH = 80;               // max bound params per statement (D1 limit: 100)
-const READ_PAGE = 16;                 // chunk rows per SELECT when reading
+const READ_PAGE = 4;                  // chunk rows per SELECT when reading (4 × 512KiB = 2MiB)
+
+// One HTTP upload piece = up to 8 chunks. Chunk seq = pieceSeq * CHUNKS_PER_PIECE + i,
+// so pieces can be uploaded in parallel / out of order without seq collisions.
+export const CHUNKS_PER_PIECE = 8;
+export const PIECE_MAX = CHUNKS_PER_PIECE * CHUNK_SIZE; // 4 MiB
+
+// Max file size. Pages Functions (free) have 128 MB memory and downloads are
+// assembled in memory, so keep this well below that.
+export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MiB
 
 export class StoreError extends Error {
   constructor(message, status = 400) {
@@ -178,11 +187,23 @@ export async function initFile(db, path, mime, sizeHint = 0) {
   return r.id;
 }
 
-export async function putChunk(db, id, seq, bytes) {
+// Store one upload piece (<= 4 MiB). It is split into 512 KiB rows because a
+// single D1 row/BLOB cannot exceed ~2 MB.
+export async function putPiece(db, id, pieceSeq, bytes) {
+  if (bytes.byteLength > PIECE_MAX) {
+    throw new StoreError(`Piece too large (max ${PIECE_MAX} bytes)`, 413);
+  }
+  if (!Number.isInteger(pieceSeq) || pieceSeq < 0) throw new StoreError('Bad seq', 400);
   const n = await db.prepare('SELECT is_folder FROM nodes WHERE id = ?').bind(id).first();
   if (!n || n.is_folder) throw new StoreError('Upload target not found', 404);
-  await db.prepare('INSERT OR REPLACE INTO chunks (node_id, seq, data) VALUES (?, ?, ?)')
-    .bind(id, seq | 0, bytes).run();
+  const stmts = [];
+  for (let i = 0; i * CHUNK_SIZE < bytes.byteLength; i++) {
+    stmts.push(
+      db.prepare('INSERT OR REPLACE INTO chunks (node_id, seq, data) VALUES (?, ?, ?)')
+        .bind(id, pieceSeq * CHUNKS_PER_PIECE + i,
+              bytes.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, bytes.byteLength))));
+  }
+  if (stmts.length) await db.batch(stmts);
 }
 
 // Finalize a chunked upload: verify received bytes and set final size.
@@ -201,6 +222,7 @@ export async function finishFile(db, id, expectedSize) {
 // One-shot write of a whole file from a single buffer.
 export async function writeFile(db, path, bytes, mime) {
   path = assertChildPath(path);
+  if (bytes.byteLength > MAX_FILE_SIZE) throw new StoreError('File too large (max 50 MB)', 413);
   const id = await initFile(db, path, mime, bytes.byteLength);
   await insertChunks(db, id, bytes);
   return id;
@@ -211,20 +233,29 @@ export async function readFile(db, path) {
   const node = await getNode(db, path);
   if (!node) throw new StoreError('Not found', 404);
   if (node.is_folder) throw new StoreError('Is a folder', 400);
-  const parts = [];
+  // Pre-allocate the output buffer and fill it page by page, so the file is
+  // never held in memory twice (Pages Functions: 128 MB limit).
+  let out = new Uint8Array(node.size || 0);
+  let o = 0;
   let offset = 0;
   while (true) {
     const page = await db.prepare(
       'SELECT data FROM chunks WHERE node_id = ? ORDER BY seq LIMIT ? OFFSET ?'
     ).bind(node.id, READ_PAGE, offset).all();
-    for (const row of page.results) parts.push(new Uint8Array(row.data));
+    for (const row of page.results) {
+      const part = new Uint8Array(row.data);
+      if (o + part.length > out.length) {           // size metadata off: grow
+        const bigger = new Uint8Array(o + part.length);
+        bigger.set(out.subarray(0, o));
+        out = bigger;
+      }
+      out.set(part, o);
+      o += part.length;
+    }
     if (page.results.length < READ_PAGE) break;
     offset += READ_PAGE;
   }
-  const total = parts.reduce((a, b) => a + b.length, 0);
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const p of parts) { out.set(p, o); o += p.length; }
+  if (o !== out.length) out = out.subarray(0, o);
   return { node, bytes: out };
 }
 
