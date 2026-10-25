@@ -117,6 +117,8 @@ async function handleGet(request, db, path) {
 
 async function handlePut(request, db, path) {
   if (path === '/') return new Response('400 Invalid target', { status: 400 });
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > store.MAX_FILE_SIZE) return new Response('413 File too large (max 50 MB)', { status: 413 });
   // Lenient: auto-create parent collections so drag-drop "just works".
   await store.mkdirp(db, store.parentOf(path));
   const existing = await store.getNode(db, path);
